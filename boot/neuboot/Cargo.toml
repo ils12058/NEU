@@ -1,0 +1,18 @@
+[package]
+name = "neuboot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "neuboot"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+uefi.workspace = true
+
+[lints]
+workspace = true

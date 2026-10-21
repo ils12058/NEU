@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-unknown-uefi"
+
+[target.x86_64-unknown-uefi]
+# Omit wall-clock build time from the PE/COFF executable.
+rustflags = ["-C", "link-arg=/timestamp:0"]
