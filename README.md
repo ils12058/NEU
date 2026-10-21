@@ -5,11 +5,44 @@ include AI-native interaction, agents as system participants, and AI-aware resou
 management. The privileged kernel must remain independent of AI inference and
 enforce predictable execution, memory isolation, and resource access.
 
-This repository currently implements **NeuBoot v0.2.0 only**: a small Rust UEFI
+This repository currently implements **NeuBoot v0.3.0 only**: a small Rust UEFI
 application that initializes UEFI support, reports firmware identity, summarizes
 a memory-map snapshot, and inspects optional graphics capabilities. It uses the
-firmware's text console, pauses for five seconds, and returns `Status::SUCCESS`
-to firmware. Kernel loading remains outside the current milestone.
+firmware's text console, finds its own boot volume, and validates a bounded test
+input. On success it pauses for five seconds and returns `Status::SUCCESS` to
+firmware. Kernel loading remains outside the current milestone.
+
+## Boot volume and provisional input
+
+NeuBoot resolves the filesystem associated with its own `LoadedImage` through
+`boot::get_image_file_system(boot::image_handle())`. It never chooses a first
+available filesystem, enumerates directory entries, or accepts an input path.
+It opens only **`\EFI\NEU\BOOT.INP`**, with `FileMode::Read`. File/root handles and
+scoped protocol guards close on success and on errors.
+
+The dedicated fixture is `boot/neuboot/fixtures/boot-input-v1.bin`. It is a
+12-byte little-endian record: `NEUI` magic, `u16` version 1, `u16` total length 12,
+and a required `u32` diagnostic-fixture kind 1. A 64-byte maximum applies before
+parsing; a 65-byte stack buffer reads at most one extra byte to detect oversize.
+The reader handles partial reads and requires EOF before validation. Extra
+bytes, bad magic/length, unsupported versions, and invalid kinds are rejected.
+There is no kernel filename or executable data in this provisional format.
+
+| Condition | Application outcome / returned UEFI status |
+| --- | --- |
+| Valid v1 fixture | Validation and bootstrap success / `SUCCESS` |
+| Boot volume unavailable | Expected rejection / original `NOT_FOUND`, `UNSUPPORTED`, or `NO_MEDIA` |
+| Input missing | Expected rejection / `NOT_FOUND` |
+| Malformed input or directory in place of a file | Expected rejection / `COMPROMISED_DATA` |
+| Unsupported version in a valid envelope | Expected rejection / `UNSUPPORTED` |
+| Input larger than 64 bytes | Expected rejection / `BAD_BUFFER_SIZE` |
+| Unexpected firmware I/O failure | Fatal boot attempt / original error status |
+
+Rejections use `[REJECT]`; unexpected firmware failures use `[ERROR]`. Both
+withhold validation/bootstrap success, pause briefly, and return an error to
+firmware. An expected rejection is not a successful boot. See
+[ADR 0002](docs/adr/0002-provisional-boot-input-contract.md) for the exact format,
+validation precedence, error policy, and provisional compatibility limits.
 
 ## Firmware discovery
 
@@ -70,7 +103,7 @@ Apple Silicon, with one x86-64 CPU, 128 MiB RAM, and networking disabled.
 ```sh
 make setup       # Install the pinned toolchain, components, and UEFI target
 make build       # Build release image and check its PE/COFF headers
-make check       # Rust formatting, Clippy, and smoke-validator regression tests
+make check       # Rust formatting, Clippy, Rust input tests, and smoke-validator tests
 ```
 
 Without Make:
@@ -80,8 +113,13 @@ rustup target add x86_64-unknown-uefi
 python3 scripts/neuboot.py build
 cargo fmt --all -- --check
 cargo clippy --locked --package neuboot -- -D warnings
+python3 scripts/neuboot.py test
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
+
+The small `no_std` input library runs its Rust unit tests on the detected host
+target. The `uefi` dependency remains pinned and is enabled only for UEFI targets;
+host tests exercise the same parser and bounded reader without firmware mocks.
 
 The underlying Cargo build command is:
 
@@ -100,7 +138,7 @@ across different host paths or platforms still requires separate verification.
 
 ```sh
 make run         # Open QEMU and boot NeuBoot
-make smoke       # Verify discovery and firmware return, with and without GOP
+make smoke       # Two valid-input scenarios and five rejection scenarios
 
 # Direct equivalents / options
 python3 scripts/neuboot.py run
@@ -108,13 +146,19 @@ python3 scripts/neuboot.py run --headless
 python3 scripts/neuboot.py smoke --timeout 60
 python3 scripts/neuboot.py smoke --require-gop
 python3 scripts/neuboot.py smoke --no-graphics
+python3 scripts/neuboot.py smoke --require-gop --decoy-volume
+python3 scripts/neuboot.py smoke --boot-input missing
 ```
+
+`--boot-input` also accepts `malformed`, `unsupported`, `oversized`, and
+`directory`. These options prepare fixtures inside temporary VM media; they do
+not take arbitrary host paths or affect real disks.
 
 Application output structure (values depend on firmware; type rows abbreviated):
 
 ```text
 NEU
-NeuBoot v0.2.0
+NeuBoot v0.3.0
 
 [OK] UEFI environment initialized
 [OK] NeuBoot execution started
@@ -129,6 +173,8 @@ NeuBoot v0.2.0
 [INFO] GOP pixel format: <format>
 [INFO] GOP framebuffer size: <bytes> bytes
 [OK] Firmware discovery completed
+[OK] Boot volume located
+[OK] Boot input validated: version 1, diagnostic fixture
 [OK] Bootstrap milestone completed
 [OK] Returning to firmware
 ```
@@ -137,8 +183,9 @@ Without GOP, the graphics fields are replaced by
 `[INFO] GOP: unavailable (protocol not found)`. The completion and return messages
 still appear.
 
-The runner builds the application and copies it to `EFI/BOOT/BOOTX64.EFI` in a
-fresh temporary directory under `target/neuboot/`. QEMU exposes that directory as
+The runner builds the application and copies it to `EFI/BOOT/BOOTX64.EFI`, together
+with the fixture at `EFI/NEU/BOOT.INP`, in a fresh temporary directory under
+`target/neuboot/`. QEMU exposes that directory as
 a **read-only virtual FAT disk** on VirtIO with explicit boot priority, and uses
 a private writable copy of the OVMF variable-store template. Firmware code is
 opened read-only. Temporary VM files are removed when the runner exits. No host
@@ -153,15 +200,23 @@ of hardcoding it. It then requires an OVMF boot-manager continuation after
 NeuBoot's final return marker and stops QEMU. Boot-entry IDs, firmware versions,
 memory counts, resolution, and framebuffer size are not pinned by assertions.
 
-`make smoke` runs a GOP-present scenario and a second VM with `-vga none` that
-requires the expected missing-protocol result. Logs are saved as
-`target/neuboot/smoke.log` and `target/neuboot/smoke-no-graphics.log`. A direct
-`smoke` command accepts optional GOP absence unless `--require-gop` is given.
-`run --no-graphics` is also available and implies headless operation.
+`make smoke` runs a GOP-present VM with an invalid decoy volume attached before
+the actual boot disk, then a valid-input VM with `-vga none`. It also runs five
+independent rejection scenarios: missing, malformed, unsupported, oversized, and
+directory input. Negative checks require the exact rejection/status, no success
+claim, an OVMF failed-start report, and subsequent firmware continuation. The
+harness reports an expected rejection separately from successful validation.
+
+Logs are saved under `target/neuboot/`, named `smoke-decoy.log`,
+`smoke-no-graphics.log`, and `smoke-<input-scenario>.log`. A direct default smoke
+uses `smoke.log` and accepts optional GOP absence unless `--require-gop` is given.
+`run --no-graphics` implies headless operation; `run --boot-input <scenario>` is
+available for manual inspection of rejection behavior.
 
 The smoke harness requires an OVMF build with serial text-console output and
-`BdsDxe` boot-manager traces. It verifies resumed firmware, not the numeric value
-of the returned status. Other firmware logging layouts may need an adapted
+`BdsDxe` boot-manager traces. It verifies the StartImage success/failure class and
+resumed firmware; it does not independently decode the numeric returned status.
+Other firmware logging layouts may need an adapted
 continuation check even if the application executes correctly.
 
 If firmware detection fails, provide a matching non-Secure-Boot x86-64 pair:
@@ -186,7 +241,7 @@ This removes build outputs and saved VM logs under `target/`.
 
 ## Status and limits
 
-Milestones 001 and 002 provide firmware initialization and read-only discovery.
+Milestones 001–003 provide firmware discovery and a bounded boot-input preflight.
 There is no kernel image, ELF loader, kernel handoff, `ExitBootServices`, custom
 kernel allocator, virtual memory, interrupt handling, scheduler, Secure Boot support,
 recovery system, AI execution, or desktop interface. No physical-hardware boot
@@ -195,7 +250,8 @@ they contain real implementation.
 
 Validation results and their limits are recorded in
 [milestone 001 verification](docs/verification-001.md) and
-[milestone 002 verification](docs/verification-002.md).
+[milestone 002 verification](docs/verification-002.md), followed by the current
+[milestone 003 verification](docs/verification-003.md).
 
 See [ADR 0001](docs/adr/0001-rust-uefi-bootstrap.md) for the initial decision and
 the official API references used. Discovery uses the pinned crate's documented
@@ -204,9 +260,14 @@ the official API references used. Discovery uses the pinned crate's documented
 [`GraphicsOutput`](https://docs.rs/uefi/0.41.0/uefi/proto/console/gop/struct.GraphicsOutput.html)
 APIs, including the documented behavior of
 [`open_protocol_exclusive`](https://docs.rs/uefi/0.41.0/uefi/boot/fn.open_protocol_exclusive.html).
-These observations do not define or retain a kernel handoff structure, so no
-additional architecture decision is needed for this milestone.
+Boot-volume access uses the documented
+[`get_image_file_system`](https://docs.rs/uefi/0.41.0/uefi/boot/fn.get_image_file_system.html),
+[`File`](https://docs.rs/uefi/0.41.0/uefi/proto/media/file/trait.File.html), and
+[`RegularFile`](https://docs.rs/uefi/0.41.0/uefi/proto/media/file/struct.RegularFile.html)
+APIs. The new input/error policy is recorded in ADR 0002; no kernel handoff
+structure is defined or retained.
 
-A proposed next milestone is a read-only check of the boot volume and an
-explicit boot-input/error-handling contract, still without executing a kernel.
+A recommended next milestone is a separately reviewed kernel-artifact and
+boot-information ownership contract, before implementing a loader. The current
+fixture is provisional, unauthenticated, and unsuitable as a stable kernel ABI.
 Kernel loading requires a separate instruction.

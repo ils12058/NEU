@@ -19,6 +19,15 @@ TARGET = ROOT / "target"
 ARTIFACTS = TARGET / "neuboot"
 UEFI_TARGET = "x86_64-unknown-uefi"
 IMAGE = TARGET / UEFI_TARGET / "release" / "neuboot.efi"
+INPUT_FIXTURE = ROOT / "boot" / "neuboot" / "fixtures" / "boot-input-v1.bin"
+MAX_INPUT_BYTES = 64
+INPUT_ERRORS = {
+    "missing": ("[REJECT] Boot input: file not found", "NOT_FOUND"),
+    "malformed": ("[REJECT] Boot input: invalid contents", "COMPROMISED_DATA"),
+    "unsupported": ("[REJECT] Boot input: unsupported version 2", "UNSUPPORTED"),
+    "oversized": (f"[REJECT] Boot input: oversized (limit {MAX_INPUT_BYTES} bytes)", "BAD_BUFFER_SIZE"),
+    "directory": ("[REJECT] Boot input: invalid contents", "COMPROMISED_DATA"),
+}
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -51,6 +60,34 @@ def build():
         cwd=ROOT, text=True,
     ))
     return next(package["version"] for package in metadata["packages"] if package["name"] == "neuboot")
+
+
+def unit_tests():
+    details = subprocess.check_output(["rustc", "-vV"], cwd=ROOT, text=True)
+    host = next(line[len("host: "):] for line in details.splitlines() if line.startswith("host: "))
+    subprocess.run(["cargo", "test", "--locked", "--lib", "--target", host], cwd=ROOT, check=True)
+
+
+def prepare_input(esp, scenario):
+    """Prepare exactly the fixed contract path on a private, unmounted directory."""
+    directory = esp / "EFI" / "NEU"
+    directory.mkdir(parents=True)
+    path = directory / "BOOT.INP"
+    if scenario == "missing":
+        return
+    if scenario == "directory":
+        path.mkdir()
+        return
+    data = bytearray(INPUT_FIXTURE.read_bytes())
+    if scenario == "malformed":
+        data[:4] = b"BAD!"
+    elif scenario == "unsupported":
+        data[4:6] = (2).to_bytes(2, "little")
+    elif scenario == "oversized":
+        data.extend(b"\0" * (MAX_INPUT_BYTES + 1 - len(data)))
+    elif scenario != "valid":
+        raise RuntimeError(f"Unknown boot-input scenario: {scenario}")
+    path.write_bytes(data)
 
 
 def firmware(qemu):
@@ -107,17 +144,35 @@ def stop(process):
             process.wait()
 
 
-def inspect_console(console, version, no_graphics=False, require_gop=False):
+def inspect_console(console, version, no_graphics=False, require_gop=False, boot_input="valid"):
     """Validate complete discovery output; separately observe firmware resuming."""
     console = ANSI_ESCAPE.sub("", console).replace("\r", "")
     if "[PANIC]" in console or "[ERROR]" in console:
         raise RuntimeError("NeuBoot reported a failure")
     lines = console.splitlines()
+    if console and not console.endswith("\n"):
+        lines = lines[:-1]
+    rejection = INPUT_ERRORS.get(boot_input)
+    if boot_input != "valid" and rejection is None:
+        raise RuntimeError(f"Unknown boot-input scenario: {boot_input}")
+    for line in lines:
+        if line.startswith("[REJECT]") and (rejection is None or line != rejection[0]):
+            raise RuntimeError(f"Unexpected boot-input rejection: {line}")
+        if rejection is not None and (line.startswith("[OK] Boot input validated:")
+                                      or line == "[OK] Bootstrap milestone completed"):
+            raise RuntimeError("Rejected input was incorrectly reported as successful")
     markers = (
         "NEU", f"NeuBoot v{version}",
         "[OK] UEFI environment initialized", "[OK] NeuBoot execution started",
-        "[OK] Firmware discovery completed", "[OK] Bootstrap milestone completed",
+        "[OK] Firmware discovery completed", "[OK] Boot volume located",
+    )
+    markers += (
+        "[OK] Boot input validated: version 1, diagnostic fixture",
+        "[OK] Bootstrap milestone completed",
         "[OK] Returning to firmware",
+    ) if rejection is None else (
+        rejection[0], f"[INFO] Boot input status: {rejection[1]}",
+        "[INFO] Returning to firmware after boot failure",
     )
     positions = []
     for index, line in enumerate(lines):
@@ -188,13 +243,26 @@ def inspect_console(console, version, no_graphics=False, require_gop=False):
 
     # Observe OVMF continuing after our final marker, rather than assuming that
     # waiting a fixed duration proves return. Do not hardcode boot IDs or targets.
-    resumed = any(line.startswith(("BdsDxe: loading ", "BdsDxe: starting "))
-                  for line in lines[positions[-1] + 1:])
+    tail = lines[positions[-1] + 1:]
+    continuation = next((index for index, line in enumerate(tail)
+                         if line.startswith(("BdsDxe: loading ", "BdsDxe: starting "))), None)
+    resumed = continuation is not None
+    if resumed:
+        failed_start = any(line.startswith("BdsDxe: failed to start ") for line in tail[:continuation])
+        if failed_start != (rejection is not None):
+            raise RuntimeError("Firmware start-image result does not match the expected boot outcome")
     return lines[positions[0]:positions[-1] + 1], resumed
 
 
-def smoke(command, timeout, capture, version, no_graphics, require_gop):
-    log = ARTIFACTS / ("smoke-no-graphics.log" if no_graphics else "smoke.log")
+def smoke(command, capture, version, args):
+    parts = ["smoke"]
+    if args.no_graphics:
+        parts.append("no-graphics")
+    if args.boot_input != "valid":
+        parts.append(args.boot_input)
+    if args.decoy_volume:
+        parts.append("decoy")
+    log = ARTIFACTS / ("-".join(parts) + ".log")
     print(f"Capturing firmware console output: {log}", flush=True)
     # Each VM reads its own capture even if another developer starts a second run.
     with capture.open("w") as output:
@@ -202,23 +270,25 @@ def smoke(command, timeout, capture, version, no_graphics, require_gop):
             command, cwd=ROOT, stdin=subprocess.DEVNULL,
             stdout=output, stderr=subprocess.STDOUT,
         )
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + args.timeout
         try:
             while time.monotonic() < deadline:
                 observed = inspect_console(
-                    capture.read_text(errors="replace"), version, no_graphics, require_gop
+                    capture.read_text(errors="replace"), version, args.no_graphics,
+                    args.require_gop, args.boot_input,
                 )
                 status = process.poll()
                 if status is not None and status != 0:
                     raise RuntimeError(f"QEMU exited with status {status}; inspect {log}")
                 if observed is not None and observed[1]:
                     print("\n".join(observed[0]), flush=True)
-                    print(f"PASS: firmware discovery and return observed through OVMF; log: {log}")
+                    outcome = "validated input" if args.boot_input == "valid" else f"expected input rejection ({args.boot_input})"
+                    print(f"PASS: {outcome} and firmware continuation observed through OVMF; log: {log}")
                     return
                 if status is not None:
                     raise RuntimeError(f"QEMU exited before NeuBoot output was verified; inspect {log}")
                 time.sleep(0.1)
-            raise RuntimeError(f"Discovery and firmware return were not verified within {timeout}s; inspect {log}")
+            raise RuntimeError(f"Boot outcome and firmware return were not verified within {args.timeout}s; inspect {log}")
         finally:
             stop(process)
             shutil.copyfile(capture, log)
@@ -239,6 +309,7 @@ def run(args):
         boot = esp / "EFI" / "BOOT"
         boot.mkdir(parents=True)
         shutil.copyfile(IMAGE, boot / "BOOTX64.EFI")
+        prepare_input(esp, args.boot_input)
         # Only this private copy of the firmware variable store is writable.
         private_vars = temporary / "OVMF_VARS.fd"
         shutil.copyfile(variables, private_vars)
@@ -248,6 +319,15 @@ def run(args):
             "-net", "none", "-no-reboot",
             "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={drive_path(code)}",
             "-drive", f"if=pflash,format=raw,unit=1,file={drive_path(private_vars)}",
+        ]
+        if args.decoy_volume:
+            decoy = temporary / "decoy"
+            prepare_input(decoy, "malformed")
+            command += [
+                "-drive", f"if=none,id=decoy,format=raw,readonly=on,file=fat:{drive_path(decoy)}",
+                "-device", "virtio-blk-pci,drive=decoy,bootindex=2",
+            ]
+        command += [
             "-drive", f"if=none,id=neuboot,format=raw,readonly=on,file=fat:{drive_path(esp)}",
             "-device", "virtio-blk-pci,drive=neuboot,bootindex=1",
         ]
@@ -255,8 +335,7 @@ def run(args):
             command += ["-vga", "none"]
         if args.command == "smoke":
             command += ["-display", "none", "-monitor", "none", "-serial", "stdio"]
-            smoke(command, args.timeout, temporary / "console.log", version,
-                  args.no_graphics, args.require_gop)
+            smoke(command, temporary / "console.log", version, args)
         else:
             command += ["-serial", "mon:stdio"]
             if args.headless or args.no_graphics:
@@ -275,6 +354,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("build", help="Build and inspect the UEFI executable")
+    commands.add_parser("test", help="Run firmware-independent Rust input tests on the host")
     run_parser = commands.add_parser("run", help="Boot NeuBoot in QEMU")
     run_parser.add_argument("--headless", action="store_true", help="Use only the serial console")
     smoke_parser = commands.add_parser("smoke", help="Verify firmware console output in QEMU")
@@ -284,6 +364,10 @@ def main():
     for vm_parser in (run_parser, smoke_parser):
         vm_parser.add_argument("--no-graphics", action="store_true",
                                help="Disable emulated VGA to exercise missing GOP (implies headless)")
+        vm_parser.add_argument("--boot-input", choices=("valid", *INPUT_ERRORS), default="valid",
+                               help="Boot-input fixture scenario (default: valid)")
+        vm_parser.add_argument("--decoy-volume", action="store_true",
+                               help="Attach a second read-only volume with invalid input before the boot disk")
     args = parser.parse_args()
     if args.command == "smoke" and args.timeout <= 6:
         parser.error("--timeout must exceed 6 seconds")
@@ -292,6 +376,8 @@ def main():
     try:
         if args.command == "build":
             build()
+        elif args.command == "test":
+            unit_tests()
         else:
             run(args)
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
