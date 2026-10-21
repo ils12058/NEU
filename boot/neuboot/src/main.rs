@@ -4,6 +4,8 @@
 use core::time::Duration;
 use uefi::{Status, boot, entry, println};
 
+mod discovery;
+
 #[entry]
 fn main() -> Status {
     if let Err(error) = uefi::helpers::init() {
@@ -16,9 +18,16 @@ fn main() -> Status {
     println!();
     println!("[OK] UEFI environment initialized");
     println!("[OK] NeuBoot execution started");
+
+    if let Err(error) = discovery::report() {
+        println!("[ERROR] Firmware discovery failed: {error}");
+        return error.status();
+    }
+
     println!("[OK] Bootstrap milestone completed");
 
     // Keep the firmware console readable before returning control to firmware.
     boot::stall(Duration::from_secs(5));
+    println!("[OK] Returning to firmware");
     Status::SUCCESS
 }

@@ -2,6 +2,7 @@
 """Build NeuBoot and run it with disposable QEMU/OVMF resources (Python 3.9+)."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import platform
@@ -18,13 +19,6 @@ TARGET = ROOT / "target"
 ARTIFACTS = TARGET / "neuboot"
 UEFI_TARGET = "x86_64-unknown-uefi"
 IMAGE = TARGET / UEFI_TARGET / "release" / "neuboot.efi"
-EXPECTED_LINES = (
-    "NEU",
-    "NeuBoot v0.1.0",
-    "[OK] UEFI environment initialized",
-    "[OK] NeuBoot execution started",
-    "[OK] Bootstrap milestone completed",
-)
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -52,6 +46,11 @@ def build():
     if (machine, magic, subsystem) != (0x8664, 0x20B, 10) or entry == 0:
         raise RuntimeError("Expected an x86-64 PE32+ EFI application with an entry point")
     print(f"Verified x86-64 PE32+ EFI application: {IMAGE}", flush=True)
+    metadata = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+        cwd=ROOT, text=True,
+    ))
+    return next(package["version"] for package in metadata["packages"] if package["name"] == "neuboot")
 
 
 def firmware(qemu):
@@ -108,8 +107,94 @@ def stop(process):
             process.wait()
 
 
-def smoke(command, timeout, capture):
-    log = ARTIFACTS / "smoke.log"
+def inspect_console(console, version, no_graphics=False, require_gop=False):
+    """Validate complete discovery output; separately observe firmware resuming."""
+    console = ANSI_ESCAPE.sub("", console).replace("\r", "")
+    if "[PANIC]" in console or "[ERROR]" in console:
+        raise RuntimeError("NeuBoot reported a failure")
+    lines = console.splitlines()
+    markers = (
+        "NEU", f"NeuBoot v{version}",
+        "[OK] UEFI environment initialized", "[OK] NeuBoot execution started",
+        "[OK] Firmware discovery completed", "[OK] Bootstrap milestone completed",
+        "[OK] Returning to firmware",
+    )
+    positions = []
+    for index, line in enumerate(lines):
+        if len(positions) < len(markers) and line == markers[len(positions)]:
+            positions.append(index)
+    if len(positions) != len(markers):
+        return None
+    discovery = lines[positions[3] + 1:positions[4]]
+
+    def field(prefix):
+        values = [line[len(prefix):] for line in discovery if line.startswith(prefix)]
+        if len(values) != 1 or not values[0]:
+            raise RuntimeError(f"Expected one nonempty discovery field: {prefix}")
+        return values[0]
+
+    field("[INFO] Firmware vendor: ")
+    if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", field("[INFO] UEFI specification revision: ")):
+        raise RuntimeError("Invalid UEFI specification revision")
+    if not re.fullmatch(r"0x[0-9a-fA-F]{8}", field("[INFO] Firmware revision: ")):
+        raise RuntimeError("Invalid firmware revision")
+    summary = re.fullmatch(
+        r"([1-9]\d*) descriptors, ([1-9]\d*) pages \(4 KiB each\)",
+        field("[INFO] Memory map: "),
+    )
+    if summary is None:
+        raise RuntimeError("Invalid memory-map summary")
+    descriptors, total_pages = map(int, summary.groups())
+    rows = []
+    for line in discovery:
+        if line.startswith("[INFO] Memory type "):
+            row = re.fullmatch(r"\[INFO\] Memory type (\d+) \((.+)\): (\d+) pages", line)
+            if row is None:
+                raise RuntimeError("Invalid memory-type row")
+            rows.append((int(row[1]), int(row[3])))
+    types = [ty for ty, _ in rows]
+    if not rows or len(rows) > descriptors or types != sorted(set(types)):
+        raise RuntimeError("Memory types must be unique, sorted, and backed by descriptors")
+    if any(ty > 0xFFFF_FFFF for ty in types) or sum(pages for _, pages in rows) != total_pages:
+        raise RuntimeError("Memory-type page counts do not match the snapshot total")
+
+    gop = [line for line in discovery if line.startswith(("[INFO] GOP: ", "[WARN] GOP: "))]
+    if len(gop) != 1:
+        raise RuntimeError("Expected one GOP availability result")
+    if gop[0] == "[INFO] GOP: available":
+        if no_graphics:
+            raise RuntimeError("GOP was available with emulated graphics disabled")
+        if not re.fullmatch(r"[1-9]\d*x[1-9]\d*", field("[INFO] GOP resolution: ")):
+            raise RuntimeError("Invalid GOP resolution")
+        pixel_format = field("[INFO] GOP pixel format: ")
+        size = field("[INFO] GOP framebuffer size: ")
+        if pixel_format not in {"Rgb", "Bgr", "Bitmask", "BltOnly"}:
+            raise RuntimeError("Invalid GOP pixel format")
+        if pixel_format == "BltOnly":
+            if size != "unavailable (BltOnly)":
+                raise RuntimeError("BltOnly must not expose a direct framebuffer")
+        elif not re.fullmatch(r"[1-9]\d* bytes", size):
+            raise RuntimeError("Invalid GOP framebuffer size")
+    elif "GOP: unavailable (" in gop[0]:
+        if require_gop:
+            raise RuntimeError("GOP is required for this smoke scenario")
+        if no_graphics and gop[0] != "[INFO] GOP: unavailable (protocol not found)":
+            raise RuntimeError("Expected missing GOP, rather than a failed protocol query")
+        if any(line.startswith(("[INFO] GOP resolution:", "[INFO] GOP pixel format:",
+                                "[INFO] GOP framebuffer size:")) for line in discovery):
+            raise RuntimeError("Unavailable GOP must not expose mode metadata")
+    else:
+        raise RuntimeError("Invalid GOP availability result")
+
+    # Observe OVMF continuing after our final marker, rather than assuming that
+    # waiting a fixed duration proves return. Do not hardcode boot IDs or targets.
+    resumed = any(line.startswith(("BdsDxe: loading ", "BdsDxe: starting "))
+                  for line in lines[positions[-1] + 1:])
+    return lines[positions[0]:positions[-1] + 1], resumed
+
+
+def smoke(command, timeout, capture, version, no_graphics, require_gop):
+    log = ARTIFACTS / ("smoke-no-graphics.log" if no_graphics else "smoke.log")
     print(f"Capturing firmware console output: {log}", flush=True)
     # Each VM reads its own capture even if another developer starts a second run.
     with capture.open("w") as output:
@@ -118,32 +203,22 @@ def smoke(command, timeout, capture):
             stdout=output, stderr=subprocess.STDOUT,
         )
         deadline = time.monotonic() + timeout
-        observed_at = None
         try:
             while time.monotonic() < deadline:
-                console = ANSI_ESCAPE.sub("", capture.read_text(errors="replace")).replace("\r", "")
-                if "[PANIC]" in console or "[ERROR]" in console:
-                    raise RuntimeError(f"NeuBoot reported a failure; inspect {log}")
-                lines = console.splitlines()
-                # Require the complete banner and success messages in order.
-                position = 0
-                for line in lines:
-                    if position < len(EXPECTED_LINES) and line == EXPECTED_LINES[position]:
-                        position += 1
-                if position == len(EXPECTED_LINES) and observed_at is None:
-                    observed_at = time.monotonic()
+                observed = inspect_console(
+                    capture.read_text(errors="replace"), version, no_graphics, require_gop
+                )
                 status = process.poll()
                 if status is not None and status != 0:
                     raise RuntimeError(f"QEMU exited with status {status}; inspect {log}")
-                # Allow the application's five-second pause and return to firmware.
-                if observed_at is not None and (time.monotonic() - observed_at >= 6 or status == 0):
-                    print("\n".join(EXPECTED_LINES), flush=True)
-                    print(f"PASS: NeuBoot output observed through OVMF's console; log: {log}")
+                if observed is not None and observed[1]:
+                    print("\n".join(observed[0]), flush=True)
+                    print(f"PASS: firmware discovery and return observed through OVMF; log: {log}")
                     return
                 if status is not None:
                     raise RuntimeError(f"QEMU exited before NeuBoot output was verified; inspect {log}")
                 time.sleep(0.1)
-            raise RuntimeError(f"NeuBoot output was not verified within {timeout}s; inspect {log}")
+            raise RuntimeError(f"Discovery and firmware return were not verified within {timeout}s; inspect {log}")
         finally:
             stop(process)
             shutil.copyfile(capture, log)
@@ -156,7 +231,7 @@ def run(args):
     code, variables = firmware(qemu)
     print(f"Host: {platform.system()} {platform.machine()}; guest: x86-64, one CPU, TCG", flush=True)
     print(f"OVMF code: {code}\nOVMF variables template: {variables}", flush=True)
-    build()
+    version = build()
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="qemu-", dir=ARTIFACTS) as directory:
         temporary = Path(directory)
@@ -176,12 +251,15 @@ def run(args):
             "-drive", f"if=none,id=neuboot,format=raw,readonly=on,file=fat:{drive_path(esp)}",
             "-device", "virtio-blk-pci,drive=neuboot,bootindex=1",
         ]
+        if args.no_graphics:
+            command += ["-vga", "none"]
         if args.command == "smoke":
             command += ["-display", "none", "-monitor", "none", "-serial", "stdio"]
-            smoke(command, args.timeout, temporary / "console.log")
+            smoke(command, args.timeout, temporary / "console.log", version,
+                  args.no_graphics, args.require_gop)
         else:
             command += ["-serial", "mon:stdio"]
-            if args.headless:
+            if args.headless or args.no_graphics:
                 command += ["-display", "none"]
             print("Close QEMU's window or press Ctrl-a then x in this terminal to exit.", flush=True)
             process = subprocess.Popen(command, cwd=ROOT)
@@ -201,9 +279,16 @@ def main():
     run_parser.add_argument("--headless", action="store_true", help="Use only the serial console")
     smoke_parser = commands.add_parser("smoke", help="Verify firmware console output in QEMU")
     smoke_parser.add_argument("--timeout", type=int, default=60, help="Boot timeout in seconds (default: 60)")
+    smoke_parser.add_argument("--require-gop", action="store_true",
+                              help="Require GOP to verify the graphics-present scenario")
+    for vm_parser in (run_parser, smoke_parser):
+        vm_parser.add_argument("--no-graphics", action="store_true",
+                               help="Disable emulated VGA to exercise missing GOP (implies headless)")
     args = parser.parse_args()
     if args.command == "smoke" and args.timeout <= 6:
         parser.error("--timeout must exceed 6 seconds")
+    if args.command == "smoke" and args.require_gop and args.no_graphics:
+        parser.error("--require-gop cannot be combined with --no-graphics")
     try:
         if args.command == "build":
             build()
